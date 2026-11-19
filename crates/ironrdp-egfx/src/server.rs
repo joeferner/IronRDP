@@ -64,7 +64,7 @@ use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_graphics::zgfx::{
     CompressionMode, Compressor, compress_and_wrap_egfx, wrap_uncompressed, wrap_uncompressed_recorded,
 };
-use ironrdp_pdu::gcc::Monitor;
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::{PduResult, decode_err};
 use tracing::{debug, trace, warn};
@@ -1398,7 +1398,7 @@ impl GraphicsPipelineServer {
             self.output_queue.push_back(GfxPdu::ResetGraphics(ResetGraphicsPdu {
                 width: u32::from(desktop_width),
                 height: u32::from(desktop_height),
-                monitors: Vec::new(),
+                monitors: single_monitor(desktop_width, desktop_height),
             }));
 
             self.output_width = desktop_width;
@@ -1488,6 +1488,9 @@ impl GraphicsPipelineServer {
     }
 
     /// Resize with explicit monitor configuration
+    ///
+    /// An empty `monitors` list is replaced by a single primary monitor covering the
+    /// whole desktop, as clients reject a ResetGraphics without monitors.
     pub fn resize_with_monitors(&mut self, width: u16, height: u16, monitors: Vec<Monitor>) {
         if self.state != ServerState::Ready {
             debug!("Cannot resize: not in Ready state");
@@ -1516,6 +1519,11 @@ impl GraphicsPipelineServer {
 
         self.frames.clear_pending_frames();
 
+        let monitors = if monitors.is_empty() {
+            single_monitor(width, height)
+        } else {
+            monitors
+        };
         self.output_queue.push_back(GfxPdu::ResetGraphics(ResetGraphicsPdu {
             width: u32::from(width),
             height: u32::from(height),
@@ -3077,4 +3085,21 @@ mod tests {
             );
         }
     }
+}
+
+/// A single primary monitor covering a `width` x `height` desktop.
+///
+/// FreeRDP rejects a ResetGraphics PDU whose monitor count is zero
+/// (`rdpgfx_recv_reset_graphics_pdu` fails with `ERROR_INVALID_DATA`) and closes the
+/// graphics channel, so a server that does not know the client's monitor layout
+/// describes the whole desktop as one monitor.
+/// `TS_MONITOR_DEF` bounds are inclusive ([MS-RDPBCGR] 2.2.1.3.6.1 "Monitor Definition (TS_MONITOR_DEF)").
+fn single_monitor(width: u16, height: u16) -> Vec<Monitor> {
+    vec![Monitor {
+        left: 0,
+        top: 0,
+        right: i32::from(width) - 1,
+        bottom: i32::from(height) - 1,
+        flags: MonitorFlags::PRIMARY,
+    }]
 }

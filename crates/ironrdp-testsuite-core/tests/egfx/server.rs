@@ -10,6 +10,7 @@ use ironrdp_egfx::server::{
     MixedTilePayload, QoeMetrics, Surface,
 };
 use ironrdp_graphics::zgfx::{CompressionMode, Decompressor};
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use rstest::rstest;
 
@@ -1114,6 +1115,79 @@ fn test_resize() {
 
     // Should have output PDUs
     assert!(server.has_pending_output());
+}
+
+fn ready_server() -> GraphicsPipelineServer {
+    let mut server = GraphicsPipelineServer::new(Box::new(TestHandler::new()));
+    let client_caps_pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V8 {
+        flags: CapabilitiesV8Flags::SMALL_CACHE,
+    }]));
+    server
+        .process(0, &encode_pdu(&client_caps_pdu))
+        .expect("process capabilities");
+    server
+}
+
+fn reset_graphics_monitors(pdus: &[GfxPdu]) -> Vec<Monitor> {
+    let mut resets = pdus.iter().filter_map(|pdu| match pdu {
+        GfxPdu::ResetGraphics(reset) => Some(reset.monitors.clone()),
+        _ => None,
+    });
+    let monitors = resets.next().expect("a ResetGraphics PDU");
+    assert!(resets.next().is_none(), "exactly one ResetGraphics PDU");
+    monitors
+}
+
+fn primary_monitor(width: i32, height: i32) -> Monitor {
+    Monitor {
+        left: 0,
+        top: 0,
+        right: width - 1,
+        bottom: height - 1,
+        flags: MonitorFlags::PRIMARY,
+    }
+}
+
+#[test]
+fn first_surface_reset_graphics_describes_one_primary_monitor() {
+    let mut server = ready_server();
+    server.create_surface(1920, 1080).expect("create surface");
+
+    let monitors = reset_graphics_monitors(&decode_drained_pdus(&mut server));
+
+    assert_eq!(monitors, [primary_monitor(1920, 1080)]);
+}
+
+#[test]
+fn resize_without_monitors_describes_one_primary_monitor() {
+    let mut server = ready_server();
+    server.create_surface(1920, 1080).expect("create surface");
+    server.drain_output();
+
+    server.resize(2560, 1440);
+
+    let monitors = reset_graphics_monitors(&decode_drained_pdus(&mut server));
+    assert_eq!(monitors, [primary_monitor(2560, 1440)]);
+}
+
+#[test]
+fn resize_with_monitors_keeps_the_given_layout() {
+    let mut server = ready_server();
+    let layout = vec![
+        primary_monitor(1920, 1080),
+        Monitor {
+            left: 1920,
+            top: 0,
+            right: 3839,
+            bottom: 1079,
+            flags: MonitorFlags::empty(),
+        },
+    ];
+
+    server.resize_with_monitors(3840, 1080, layout.clone());
+
+    let monitors = reset_graphics_monitors(&decode_drained_pdus(&mut server));
+    assert_eq!(monitors, layout);
 }
 
 #[test]
