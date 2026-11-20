@@ -2500,8 +2500,29 @@ impl GraphicsPipelineServer {
     ///
     /// Panics if a `GfxPdu` fails to encode. This indicates a bug in the PDU
     /// encoding logic, not a runtime condition.
-    #[expect(clippy::as_conversions, reason = "Box<T> to Box<dyn Trait> coercion")]
     pub fn drain_output(&mut self) -> Vec<DvcMessage> {
+        self.drain_output_with(false)
+    }
+
+    /// Drain the output queue like [`drain_output()`](Self::drain_output),
+    /// but send every PDU uncompressed.
+    ///
+    /// In `Auto` and `Always` modes the PDUs' bytes still enter the ZGFX
+    /// history, as for H.264 (MS-RDPEGFX 3.1.9.1.2). So the receiver's history
+    /// stays in step, and later [`drain_output()`](Self::drain_output) calls
+    /// keep compressing against it. In `Never` mode this is the same as
+    /// `drain_output()`.
+    ///
+    /// Use it for updates where compression costs far more CPU than it saves,
+    /// such as a large region of video-like content encoded with a lossless
+    /// codec: the compressor's match search grows with the size of the input,
+    /// and noisy pixels rarely match the history.
+    pub fn drain_output_uncompressed(&mut self) -> Vec<DvcMessage> {
+        self.drain_output_with(true)
+    }
+
+    #[expect(clippy::as_conversions, reason = "Box<T> to Box<dyn Trait> coercion")]
+    fn drain_output_with(&mut self, uncompressed: bool) -> Vec<DvcMessage> {
         let mode = self.compression_mode;
         let pdus: Vec<_> = self.output_queue.drain(..).collect();
 
@@ -2534,7 +2555,7 @@ impl GraphicsPipelineServer {
 
                 let wrapped = match mode {
                     CompressionMode::Never => wrap_uncompressed(&pdu_bytes),
-                    CompressionMode::Auto | CompressionMode::Always if is_h264 => {
+                    CompressionMode::Auto | CompressionMode::Always if is_h264 || uncompressed => {
                         wrap_uncompressed_recorded(&pdu_bytes, &mut self.zgfx_compressor)
                     }
                     CompressionMode::Auto | CompressionMode::Always => {
