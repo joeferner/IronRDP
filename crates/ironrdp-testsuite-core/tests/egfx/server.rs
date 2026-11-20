@@ -1,5 +1,5 @@
 use ironrdp_core::{Decode as _, Encode, ReadCursor, WriteCursor, encode_vec};
-use ironrdp_dvc::DvcProcessor as _;
+use ironrdp_dvc::{DvcMessage, DvcProcessor as _};
 use ironrdp_egfx::pdu::{
     Avc420Region, Avc444BitmapStream, CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitiesV10Flags,
     CapabilitiesV81Flags, CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitySet,
@@ -459,6 +459,77 @@ fn zgfx_sends_h264_uncompressed_and_keeps_history_in_step(
         codecs.push(wire.codec_id);
     }
     assert_eq!(codecs, [Codec1Type::ClearCodec, h264_codec, Codec1Type::ClearCodec]);
+}
+
+/// `drain_output_uncompressed` sends every PDU uncompressed but still records it in the ZGFX
+/// history, as for H.264. Compressible data, then noise drained uncompressed, then the same data
+/// again: the last one back-references the first across the noise, so it only decodes if both
+/// sides recorded the noise. 70,000 bytes of noise spans two ZGFX segments.
+#[rstest]
+fn zgfx_drain_uncompressed_keeps_history_in_step(
+    #[values(CompressionMode::Auto, CompressionMode::Always)] mode: CompressionMode,
+    #[values(8_000, 70_000)] noise_len: usize,
+) {
+    let handler = Box::new(TestHandler::new());
+    let mut server = GraphicsPipelineServer::with_compression(handler, mode);
+    let client_caps_pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V10 {
+        flags: CapabilitiesV10Flags::SMALL_CACHE,
+    }]));
+    server
+        .process(0, &encode_pdu(&client_caps_pdu))
+        .expect("process capabilities");
+    let surface_id = server.create_surface(64, 64).expect("create surface");
+
+    let mut decompressor = Decompressor::new();
+    let mut wire_pdus = |messages: Vec<DvcMessage>| -> Vec<(bool, Vec<u8>)> {
+        messages
+            .iter()
+            .filter_map(|message| {
+                let wrapped = encode_vec(message.as_ref()).expect("encode DVC message");
+                let mut decoded = Vec::new();
+                decompressor.decompress(&wrapped, &mut decoded).expect("decompress PDU");
+                match GfxPdu::decode(&mut ReadCursor::new(&decoded)).expect("decode PDU") {
+                    GfxPdu::WireToSurface1(wire) => Some((first_segment_is_compressed(&wrapped), wire.bitmap_data)),
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    wire_pdus(server.drain_output());
+
+    let tile = b"lossless tile bytes that repeat ".repeat(64);
+    // Pseudo-random bytes (xorshift), which compression couldn't shrink anyway.
+    let mut state = 0x2545_f491u32;
+    let noise: Vec<u8> = core::iter::repeat_with(|| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state.to_le_bytes()[0]
+    })
+    .take(noise_len)
+    .collect();
+    let destination = ExclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: 16,
+        bottom: 16,
+    };
+    let send = |server: &mut GraphicsPipelineServer, data: &[u8]| {
+        server
+            .send_clearcodec_frame(surface_id, destination.clone(), data.to_vec(), 42)
+            .expect("queue ClearCodec frame");
+    };
+
+    send(&mut server, &tile);
+    assert_eq!(wire_pdus(server.drain_output()), [(true, tile.clone())]);
+    send(&mut server, &noise);
+    assert_eq!(
+        wire_pdus(server.drain_output_uncompressed()),
+        [(false, noise)],
+        "drained uncompressed"
+    );
+    send(&mut server, &tile);
+    assert_eq!(wire_pdus(server.drain_output()), [(true, tile)]);
 }
 
 // ============================================================================
